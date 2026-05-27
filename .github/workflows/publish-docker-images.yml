@@ -1,0 +1,244 @@
+name: Publish Docker images
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional upstream release tag to publish
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-docker-images
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: dataelement/Clawith
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      metadata_tags: ${{ steps.release.outputs.metadata_tags }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+
+    steps:
+      - name: Log in to GHCR for tag checks
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub for tag checks
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve upstream release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          upstream = os.environ["UPSTREAM_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          requested_tag = os.environ.get("REQUESTED_TAG", "").strip()
+          output_path = os.environ["GITHUB_OUTPUT"]
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+          }
+
+          def github_json(path):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{upstream}{path}",
+                  headers=headers,
+              )
+              with urllib.request.urlopen(request) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def github_json_or_none(path):
+              try:
+                  return github_json(path)
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      return None
+                  raise
+
+          def docker_tag(release_tag):
+              tag = release_tag
+              if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+                  return None
+              return tag
+
+          def manifest_exists(reference):
+              return subprocess.run(
+                  ["docker", "manifest", "inspect", reference],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+                  check=False,
+              ).returncode == 0
+
+          def published(tag, require_latest):
+              refs = [
+                  f"clawithcommunity/clawith-backend:{tag}",
+                  f"clawithcommunity/clawith-frontend:{tag}",
+                  f"ghcr.io/kokerzhou/clawith-backend:{tag}",
+                  f"ghcr.io/kokerzhou/clawith-frontend:{tag}",
+              ]
+              if require_latest:
+                  refs += [
+                      "clawithcommunity/clawith-backend:latest",
+                      "clawithcommunity/clawith-frontend:latest",
+                      "ghcr.io/kokerzhou/clawith-backend:latest",
+                      "ghcr.io/kokerzhou/clawith-frontend:latest",
+                  ]
+              return all(manifest_exists(ref) for ref in refs)
+
+          def releases():
+              page = 1
+              while True:
+                  batch = github_json(f"/releases?per_page=100&page={page}")
+                  if not batch:
+                      return
+                  for release in batch:
+                      if not release.get("draft"):
+                          yield release
+                  page += 1
+
+          def write(key, value):
+              with open(output_path, "a", encoding="utf-8") as output:
+                  if "\n" in value:
+                      output.write(f"{key}<<EOF\n{value}\nEOF\n")
+                  else:
+                      output.write(f"{key}={value}\n")
+
+          latest = github_json_or_none("/releases/latest")
+          latest_tag = latest["tag_name"] if latest and not latest.get("draft") else ""
+          candidates = list(releases())
+
+          if requested_tag:
+              encoded = urllib.parse.quote(requested_tag, safe="")
+              requested = github_json(f"/releases/tags/{encoded}")
+              if requested.get("draft"):
+                  raise SystemExit("Draft releases are not published.")
+              candidates = [requested]
+
+          for release in candidates:
+              release_tag = release["tag_name"]
+              tag = docker_tag(release_tag)
+              if tag is None:
+                  print(f"Skipping release '{release_tag}' because it is not a valid Docker tag.")
+                  continue
+
+              include_latest = release_tag == latest_tag
+              if not requested_tag and published(tag, include_latest):
+                  print(f"Images already exist for upstream release {release_tag}.")
+                  continue
+
+              metadata_tags = [f"type=raw,value={tag}"]
+              if include_latest:
+                  metadata_tags.append("type=raw,value=latest")
+
+              write("tag", release_tag)
+              write("metadata_tags", "\n".join(metadata_tags))
+              write("should_publish", "true")
+              break
+          else:
+              write("tag", "")
+              write("metadata_tags", "")
+              write("should_publish", "false")
+              print("No unpublished upstream releases found.")
+          PY
+
+  publish:
+    needs: resolve
+    if: needs.resolve.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: backend
+            context: upstream/backend
+            dockerfile: upstream/backend/Dockerfile
+          - name: frontend
+            context: upstream/frontend
+            dockerfile: upstream/frontend/Dockerfile
+
+    steps:
+      - name: Checkout upstream release source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: upstream
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/kokerzhou/clawith-${{ matrix.image.name }}
+            clawithcommunity/clawith-${{ matrix.image.name }}
+          tags: |
+            ${{ needs.resolve.outputs.metadata_tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPOSITORY }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.tag }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
